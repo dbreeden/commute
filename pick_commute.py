@@ -106,7 +106,11 @@ def transit_departure(transit_details, route_to_config, current_time):
     # Only look at relevant schedules
     valid_schedule = {5: 'sat', 6: 'sun'}.get(today.weekday(), 'wkd')
 
-    next_departure = datetime.datetime.max  # The next scheduled departure
+    # Get the next departure according to Google
+    timestamp = transit_details['departure_time']['value']
+    next_departure = datetime.datetime.fromtimestamp(timestamp)
+    while next_departure < current_time:
+        next_departure += datetime.timedelta(1)
 
     schedule_params = {'command': 'schedule', 'a': AGENCY, 'r': route_tag}
     for r in ElementTree.fromstring(http_get(NEXTBUS_URL, schedule_params)):
@@ -116,6 +120,8 @@ def transit_departure(transit_details, route_to_config, current_time):
 
         for b in r.findall('tr'):
             for s in b:
+                # TODO: These schedules don't list times for every
+                # stop, so we'll have to interpolate
                 if s.attrib.get('tag') != departure_tag:
                     continue
                 # epochTime is the number of milliseconds from midnight
