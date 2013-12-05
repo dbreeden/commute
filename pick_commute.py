@@ -2,6 +2,7 @@
 import argparse
 import datetime
 import json
+import re
 import time
 import urllib
 import urllib2
@@ -18,6 +19,12 @@ AGENCY = 'sf-muni'
 def http_get(url_base, params):
     response = urllib2.urlopen("%s?%s" % (url_base, urllib.urlencode(params)))
     return response.read()
+
+non_alphanum = re.compile('[\W_]+')
+
+
+def normalize(route_tag):
+    return non_alphanum.sub('', route_tag)
 
 
 def find_stop(route_config, location):
@@ -49,9 +56,12 @@ def get_direction_name(
 
 
 def transit_departure(transit_details, route_to_config, current_time):
-    # Get the NextBus route
-    route_tag = transit_details['line']['short_name']
-    route_config = route_to_config[route_tag]
+    # Get the route from Google
+    google_route_name = transit_details['line']['short_name']
+    # Normalize route_tag
+    route_config = route_to_config[normalize(google_route_name)]
+    # Get NextBus route
+    route_tag = route_config.attrib.get('tag')
 
     # Find the NextBus stops at the given lat/lon
     departure_loc = transit_details['departure_stop']['location']
@@ -142,7 +152,7 @@ def main():
     for r in ElementTree.fromstring(
         http_get(NEXTBUS_URL, {'command': 'routeConfig', 'a': AGENCY})):
         if r.tag == 'route':
-            route_to_config[r.attrib['tag']] = r
+            route_to_config[normalize(r.attrib.get('tag'))] = r
 
     # Get routes from Google
     directions_params = {
