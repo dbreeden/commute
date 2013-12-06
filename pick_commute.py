@@ -1,5 +1,6 @@
 #!/usr/local/bin/python
 import argparse
+import collections
 import datetime
 import json
 import re
@@ -34,24 +35,65 @@ def find_stop(route_config, location):
     longitude = location['lng']
 
     def distance(stop):
-        return ((float(stop.attrib['lat']) - latitude)**2 +
-                (float(stop.attrib['lon']) - longitude)**2)
+        return ((float(stop.get('lat')) - latitude)**2 +
+                (float(stop.get('lon')) - longitude)**2)
 
     return min(route_config.findall('stop'), key=distance)
 
 
-def get_direction_name(
-        route_config, direction_tag, departure_tag, arrival_tag):
+def get_directions(route_config, departure_tag, arrival_tag):
+    """Return all the route directions that go from departure_tag to
+    arrival_tag"""
     for d in route_config.findall('direction'):
-        if d.attrib.get('tag') == direction_tag:
-            found_departure = False
-            for s in d:
-                stop_tag = s.attrib.get('tag')
-                if stop_tag == departure_tag:
-                    found_departure = True
-                elif found_departure and stop_tag == arrival_tag:
-                    return d.attrib.get('name')
-            break
+        found_departure = False
+        for s in d:
+            stop_tag = s.get('tag')
+            if stop_tag == departure_tag:
+                found_departure = True
+            elif found_departure and stop_tag == arrival_tag:
+                yield d
+                break
+
+
+def get_block_time(block, stop_tag, direction):
+    """Return the time of departure from the given stop."""
+    departure_time = datetime.time.max
+
+    all_stop_tags = [s.get('tag') for s in direction]
+    stop_index = all_stop_tags.index(stop_tag)
+
+    last_timestamp = -1
+    last_index = None
+    for s in block:
+        timestamp = int(s.get('epochTime'))
+        if timestamp < 0:
+            continue
+
+        curr_stop_tag = s.get('tag')
+        if curr_stop_tag != stop_tag:
+            # See if this stop is before or after the desired stop
+            try:
+                curr_stop_index = all_stop_tags.index(curr_stop_tag)
+            except ValueError:
+                continue
+
+            if curr_stop_index < stop_index:
+                # If it's before, save it
+                last_timestamp = timestamp
+                last_index = curr_stop_index
+                continue
+
+            # If it's after, interpolate when the bus should pass
+            # through the desired stop
+            if last_timestamp < 0:
+                return None
+
+            timestamp -= ((timestamp - last_timestamp) *
+                          float(curr_stop_index - stop_index) /
+                          (curr_stop_index - last_index))
+
+        return datetime.datetime.fromtimestamp(timestamp / 1000).time()
+
     return None
 
 
@@ -61,14 +103,14 @@ def transit_departure(transit_details, route_to_config, current_time):
     # Normalize route_tag
     route_config = route_to_config[normalize(google_route_name)]
     # Get NextBus route
-    route_tag = route_config.attrib.get('tag')
+    route_tag = route_config.get('tag')
 
     # Find the NextBus stops at the given lat/lon
     departure_loc = transit_details['departure_stop']['location']
-    departure_tag = find_stop(route_config, departure_loc).attrib.get('tag')
+    departure_tag = find_stop(route_config, departure_loc).get('tag')
 
     arrival_loc = transit_details['arrival_stop']['location']
-    arrival_tag = find_stop(route_config, arrival_loc).attrib.get('tag')
+    arrival_tag = find_stop(route_config, arrival_loc).get('tag')
 
     print('\t\t%s from %s to %s' % (
             transit_details['line']['short_name'],
@@ -83,53 +125,57 @@ def transit_departure(transit_details, route_to_config, current_time):
                 's': departure_tag,
     }))
 
-    direction = None
+    good_directions = tuple(
+        get_directions(route_config, departure_tag, arrival_tag))
+    good_tags = {d.get('tag') for d in good_directions}
+
     for d in predictions[0]:
         for p in d:
             # If we won't miss the predicted departure and the arrival
             # location is in this direction, return the prediction
-            prediction_dir = get_direction_name(
-                route_config, p.attrib.get('dirTag'),
-                departure_tag, arrival_tag)
-            if prediction_dir is None:
+            if p.get('dirTag') not in good_tags:
                 continue
-            direction = prediction_dir
-            timestamp = int(p.attrib.get('epochTime')) / 1000
+            timestamp = int(p.get('epochTime')) / 1000
             prediction_time = datetime.datetime.fromtimestamp(timestamp)
             if prediction_time >= current_time:
                 print("\t\tDepart at %s" % prediction_time.time())
                 return prediction_time
 
     # No prediction.  Find the next scheduled time
-    today = datetime.date.today()
-
-    # Only look at relevant schedules
-    valid_schedule = {5: 'sat', 6: 'sun'}.get(today.weekday(), 'wkd')
 
     # Get the next departure according to Google
     timestamp = transit_details['departure_time']['value']
     next_departure = datetime.datetime.fromtimestamp(timestamp)
     while next_departure < current_time:
         next_departure += datetime.timedelta(1)
+    use_google = True
+
+    # Only look at relevant schedules
+    valid_schedule = {5: 'sat', 6: 'sun'}.get(current_time.weekday(), 'wkd')
+
+    name_to_directions = collections.defaultdict(list)
+    for d in good_directions:
+        name_to_directions[d.get('name')].append(d)
 
     schedule_params = {'command': 'schedule', 'a': AGENCY, 'r': route_tag}
     for r in ElementTree.fromstring(http_get(NEXTBUS_URL, schedule_params)):
-        if (r.attrib.get('serviceClass') != valid_schedule or
-                r.attrib.get('direction') != direction):
+        if r.get('serviceClass') != valid_schedule:
             continue
 
-        for b in r.findall('tr'):
-            for s in b:
-                # TODO: These schedules don't list times for every
-                # stop, so we'll have to interpolate
-                if s.attrib.get('tag') != departure_tag:
+        directions = name_to_directions.get(r.get('direction'))
+        if directions is None:
+            continue
+
+        for d in directions:
+            for b in r.findall('tr'):
+                # Get the departure time at the stop for this block
+                block_time = get_block_time(b, departure_tag, d)
+                if block_time is None:
                     continue
-                # epochTime is the number of milliseconds from midnight
-                timestamp = int(s.attrib.get('epochTime')) / 1000
 
                 # Get that time for today
                 scheduled_time = datetime.datetime.combine(
-                    today, datetime.datetime.fromtimestamp(timestamp).time())
+                    current_time.date(), block_time)
 
                 # If it's already passed, get the time for tomorrow.
                 # TODO: This is a hack; handle if today is Friday and
@@ -139,9 +185,11 @@ def transit_departure(transit_details, route_to_config, current_time):
 
                 if scheduled_time < next_departure:
                     next_departure = scheduled_time
+                    use_google = False
                 break
     if next_departure < datetime.datetime.max:
-        print("\t\tDepart at %s (scheduled)" % next_departure.time())
+        print("\t\tDepart at %s (%s)" %
+              (next_departure.time(), 'Google' if use_google else 'scheduled'))
     else:
         print("\t\tERROR: Unable to find next scheduled departure")
     return next_departure
@@ -150,6 +198,7 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('origin')
     parser.add_argument('destination')
+    parser.add_argument('--leave_at')
 
     args = parser.parse_args()
 
@@ -158,7 +207,13 @@ def main():
     for r in ElementTree.fromstring(
         http_get(NEXTBUS_URL, {'command': 'routeConfig', 'a': AGENCY})):
         if r.tag == 'route':
-            route_to_config[normalize(r.attrib.get('tag'))] = r
+            route_to_config[normalize(r.get('tag'))] = r
+
+    if args.leave_at is None:
+        departure_time = time.time()
+    else:
+        departure_time = time.mktime(
+            time.strptime(args.leave_at, '%m/%d/%Y %H:%M'))
 
     # Get routes from Google
     directions_params = {
@@ -166,7 +221,7 @@ def main():
         'destination': args.destination,
         'sensor': 'false',
         'mode': 'transit',
-        'departure_time': int(time.time()),
+        'departure_time': int(departure_time),
         'alternatives': 'true',
     }
     routes = json.loads(http_get(DIRECTIONS_URL, directions_params))['routes']
@@ -174,7 +229,7 @@ def main():
     best_arrival = datetime.datetime.max
     best_route = None
     for r_i, r in enumerate(routes):
-        current_time = datetime.datetime.now()
+        current_time = datetime.datetime.fromtimestamp(departure_time)
 
         print("Route %d" % (r_i + 1))
 
@@ -187,6 +242,9 @@ def main():
                     s['transit_details'], route_to_config, current_time)
                 if current_time == datetime.datetime.max:
                     break
+            else:
+                # Add a minute more than Google thinks for walking
+                current_time += datetime.timedelta(minutes=1)
 
             # Add the step's duration to the current time
             current_time += datetime.timedelta(seconds=s['duration']['value'])
