@@ -1,4 +1,4 @@
-#!/usr/local/bin/python
+#!/usr/bin/python
 import argparse
 import collections
 import datetime
@@ -15,6 +15,12 @@ DIRECTIONS_URL = 'https://maps.googleapis.com/maps/api/directions/json'
 # http://www.nextbus.com/xmlFeedDocs/NextBusXMLFeed.pdf
 NEXTBUS_URL = 'http://webservices.nextbus.com/service/publicXMLFeed'
 AGENCY = 'sf-muni'
+
+GOOGLE_TO_NB_NAME = {
+    'PowellMason': '59',
+    'PowellHyde': '60',
+    'California': '61',
+}
 
 
 def http_get(url_base, params):
@@ -57,8 +63,6 @@ def get_directions(route_config, departure_tag, arrival_tag):
 
 def get_block_time(block, stop_tag, direction):
     """Return the time of departure from the given stop."""
-    departure_time = datetime.time.max
-
     all_stop_tags = [s.get('tag') for s in direction]
     stop_index = all_stop_tags.index(stop_tag)
 
@@ -100,8 +104,17 @@ def get_block_time(block, stop_tag, direction):
 def transit_departure(transit_details, route_to_config, current_time):
     # Get the route from Google
     google_route_name = transit_details['line']['short_name']
+
+    nextbus_route_name = normalize(google_route_name)
+
+    nextbus_route_name = GOOGLE_TO_NB_NAME.get(
+        nextbus_route_name, nextbus_route_name)
+
     # Normalize route_tag
-    route_config = route_to_config[normalize(google_route_name)]
+    try:
+        route_config = route_to_config[nextbus_route_name]
+    except KeyError:
+        import ipdb; ipdb.set_trace()
     # Get NextBus route
     route_tag = route_config.get('tag')
 
@@ -113,16 +126,16 @@ def transit_departure(transit_details, route_to_config, current_time):
     arrival_tag = find_stop(route_config, arrival_loc).get('tag')
 
     print('\t\t%s from %s to %s' % (
-            transit_details['line']['short_name'],
-            transit_details['departure_stop']['name'],
-            transit_details['arrival_stop']['name']))
+        transit_details['line']['short_name'],
+        transit_details['departure_stop']['name'],
+        transit_details['arrival_stop']['name']))
 
     # Get the predicted departure times for the route & stop
     predictions = ElementTree.fromstring(http_get(NEXTBUS_URL, {
-                'command': 'predictions',
-                'a': AGENCY,
-                'r': route_tag,
-                's': departure_tag,
+        'command': 'predictions',
+        'a': AGENCY,
+        'r': route_tag,
+        's': departure_tag,
     }))
 
     good_directions = tuple(
@@ -194,6 +207,7 @@ def transit_departure(transit_details, route_to_config, current_time):
         print("\t\tERROR: Unable to find next scheduled departure")
     return next_departure
 
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('origin')
@@ -205,7 +219,7 @@ def main():
     # Get config info from NextBus
     route_to_config = {}
     for r in ElementTree.fromstring(
-        http_get(NEXTBUS_URL, {'command': 'routeConfig', 'a': AGENCY})):
+            http_get(NEXTBUS_URL, {'command': 'routeConfig', 'a': AGENCY})):
         if r.tag == 'route':
             route_to_config[normalize(r.get('tag'))] = r
 
